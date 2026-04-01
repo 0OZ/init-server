@@ -3,5 +3,5 @@
 
 
 ```bash
-sudo bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/setup-server.sh)
+sudo bash <(curl -fsSL https://raw.githubusercontent.com/0OZ/init-server/main/setup-server.sh)
 ```
