@@ -29,6 +29,13 @@ if [[ $EUID -ne 0 ]]; then
     exit 1
 fi
 
+# --- Detect SSH service name (ssh on Ubuntu 24.04+, sshd on older) ---
+if systemctl list-unit-files ssh.service &>/dev/null && systemctl cat ssh.service &>/dev/null; then
+    SSH_SERVICE="ssh"
+else
+    SSH_SERVICE="sshd"
+fi
+
 # ============================================================
 # 0. Resolve / create the non-root user
 # ============================================================
@@ -122,7 +129,7 @@ info "Fish installed and set as default shell for '${REAL_USER}'."
 # 3. fail2ban
 # ============================================================
 header "fail2ban"
-apt-get install -y -qq fail2ban
+PYTHONWARNINGS=ignore apt-get install -y -qq fail2ban
 
 cat > /etc/fail2ban/jail.local <<'EOF'
 [DEFAULT]
@@ -165,7 +172,7 @@ if ! grep -q "^Include /etc/ssh/sshd_config.d/" "$SSHD_CONFIG"; then
 fi
 
 if sshd -t; then
-    systemctl restart sshd
+    systemctl restart "$SSH_SERVICE"
     info "SSH hardened — root login & password auth disabled."
 else
     error "SSH config validation failed! Reverting."
@@ -278,6 +285,7 @@ check "fail2ban SSH jail active" \
     "fail2ban-client status sshd 2>/dev/null | grep -q 'Status for the jail: sshd'"
 
 # --- SSH ---
+check "SSH service (${SSH_SERVICE}) running"   "systemctl is-active --quiet '${SSH_SERVICE}'"
 check "PasswordAuthentication disabled" \
     "sshd -T 2>/dev/null | grep -qi 'passwordauthentication no'"
 check "PermitRootLogin disabled" \
