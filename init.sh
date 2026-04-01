@@ -6,21 +6,55 @@
 #
 #  Usage:
 #    bash <(curl -fsSL https://raw.githubusercontent.com/0OZ/init-server/main/init.sh)
+#
+#  Flags:
+#    --version, -v   Print script version
+#    --check         Compare local vs remote version
 # ============================================================
 
 set -euo pipefail
+
+# --- Script version ---
+SCRIPT_VERSION="1.0.0"
+SCRIPT_REPO="0OZ/init-server"
+SCRIPT_RAW="https://raw.githubusercontent.com/${SCRIPT_REPO}/main/init.sh"
 
 # --- Colors ---
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 RED='\033[0;31m'
 BOLD='\033[1m'
+DIM='\033[2m'
 NC='\033[0m'
 
 info()  { echo -e "${GREEN}[✓]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
 error() { echo -e "${RED}[✗]${NC} $*"; }
 header(){ echo -e "\n${BOLD}── $* ──${NC}"; }
+ver()   { echo -e "  ${DIM}$1${NC} $2"; }
+
+# --- --version / --check flags ---
+if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
+    echo "init-server v${SCRIPT_VERSION}"
+    exit 0
+fi
+
+if [[ "${1:-}" == "--check" ]]; then
+    echo "Local:  v${SCRIPT_VERSION}"
+    REMOTE_VER=$(curl -fsSL "$SCRIPT_RAW" 2>/dev/null | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2)
+    if [[ -n "$REMOTE_VER" ]]; then
+        echo "Remote: v${REMOTE_VER}"
+        if [[ "$SCRIPT_VERSION" == "$REMOTE_VER" ]]; then
+            info "Up to date."
+        else
+            warn "Update available! Run:"
+            echo "  bash <(curl -fsSL ${SCRIPT_RAW})"
+        fi
+    else
+        warn "Could not fetch remote version."
+    fi
+    exit 0
+fi
 
 # --- Must run as root ---
 if [[ $EUID -ne 0 ]]; then
@@ -30,7 +64,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 # --- Detect SSH service name (ssh on Ubuntu 24.04+, sshd on older) ---
-if systemctl list-unit-files ssh.service &>/dev/null && systemctl cat ssh.service &>/dev/null; then
+if systemctl is-active ssh &>/dev/null || [[ -f /lib/systemd/system/ssh.service ]]; then
     SSH_SERVICE="ssh"
 else
     SSH_SERVICE="sshd"
@@ -101,8 +135,23 @@ info "SSH key(s) detected for '${REAL_USER}' — safe to proceed."
 
 echo ""
 echo "========================================"
-echo "  Starting Ubuntu Server Setup"
+echo "  init-server v${SCRIPT_VERSION}"
+echo "  github.com/${SCRIPT_REPO}"
 echo "========================================"
+
+# --- Check for newer script version ---
+REMOTE_VER=$(curl -fsSL --connect-timeout 3 "$SCRIPT_RAW" 2>/dev/null \
+    | grep -m1 '^SCRIPT_VERSION=' | cut -d'"' -f2 || true)
+if [[ -n "$REMOTE_VER" && "$REMOTE_VER" != "$SCRIPT_VERSION" ]]; then
+    warn "Script update available: v${SCRIPT_VERSION} → v${REMOTE_VER}"
+    warn "Re-run with: bash <(curl -fsSL ${SCRIPT_RAW})"
+    read -rp "Continue with current version anyway? [Y/n] " UPDATE_CONFIRM
+    if [[ "${UPDATE_CONFIRM,,}" == "n" ]]; then
+        exit 0
+    fi
+else
+    info "Script is up to date (v${SCRIPT_VERSION})."
+fi
 
 # ============================================================
 # 1. System update
@@ -323,14 +372,28 @@ else
 fi
 echo "========================================"
 
+# --- Version Report ---
 echo ""
-echo "  Installed:"
-echo "    • Fish shell (default for ${REAL_USER})"
-echo "    • fail2ban (SSH jail active)"
-echo "    • Docker $(docker --version 2>/dev/null | grep -oP 'Docker version \K[^,]+')"
-echo "    • Docker Compose $(docker compose version 2>/dev/null | grep -oP 'v[\d.]+')"
-echo "    • Claude Code"
-echo "    • UFW firewall"
+echo -e "  ${BOLD}Versions:${NC}"
+
+get_ver() {
+    local val
+    val=$( eval "$2" 2>/dev/null ) || val="not found"
+    printf "    %-20s %s\n" "$1" "$val"
+}
+
+get_ver "Ubuntu"          "lsb_release -ds"
+get_ver "Kernel"          "uname -r"
+get_ver "Fish"            "fish --version | awk '{print \$NF}'"
+get_ver "fail2ban"        "fail2ban-client --version | head -1 | awk '{print \$NF}'"
+get_ver "OpenSSH"         "ssh -V 2>&1 | awk '{print \$1}'"
+get_ver "Docker"          "docker --version | grep -oP 'Docker version \K[^,]+'"
+get_ver "Docker Compose"  "docker compose version --short"
+get_ver "Docker Buildx"   "docker buildx version | awk '{print \$2}'"
+get_ver "Claude Code"     "su - '${REAL_USER}' -s /bin/bash -c '~/.local/bin/claude --version' 2>/dev/null || echo 'installed'"
+get_ver "UFW"             "ufw version | awk '{print \$NF}'"
+get_ver "Git"             "git --version | awk '{print \$NF}'"
+get_ver "init-server"     "echo v${SCRIPT_VERSION}"
 echo ""
 echo "  Next steps:"
 echo "    1. Open a NEW terminal:  ssh ${REAL_USER}@<this-server>"
