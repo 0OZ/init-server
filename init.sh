@@ -262,7 +262,64 @@ systemctl start docker
 info "Docker + Docker Compose installed. '${REAL_USER}' added to docker group."
 
 # ============================================================
-# 6. Claude Code (native installer)
+# 6. GitHub CLI + private repo access
+# ============================================================
+header "GitHub"
+
+# Install gh CLI from official repo
+if ! command -v gh &>/dev/null; then
+    (type -p wget >/dev/null || apt-get install -y -qq wget)
+    mkdir -p -m 755 /etc/apt/keyrings
+    out=$(wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg) \
+        && echo "$out" | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
+    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        | tee /etc/apt/sources.list.d/github-cli-stable.list >/dev/null
+    apt-get update -qq
+    apt-get install -y -qq gh
+fi
+info "GitHub CLI (gh) installed."
+
+# Optional: configure token for private repos
+GH_CONFIGURED=false
+echo ""
+read -rp "Configure a GitHub token for private repos? [y/N] " GH_CONFIRM
+if [[ "${GH_CONFIRM,,}" == "y" ]]; then
+    echo ""
+    echo "  Create a token at: https://github.com/settings/tokens"
+    echo "  Scopes needed: repo, read:org (Fine-grained: Contents read)"
+    echo ""
+    read -rsp "  Paste your GitHub token (hidden): " GH_TOKEN
+    echo ""
+
+    if [[ -n "$GH_TOKEN" ]]; then
+        # Auth gh CLI (configures git credential helper automatically)
+        su - "$REAL_USER" -s /bin/bash -c "echo '${GH_TOKEN}' | gh auth login --with-token"
+
+        # Also set git to use gh as credential helper (works for git clone https://...)
+        su - "$REAL_USER" -s /bin/bash -c "gh auth setup-git"
+
+        # Set git identity if not already configured
+        EXISTING_NAME=$(su - "$REAL_USER" -s /bin/bash -c "git config --global user.name" 2>/dev/null || true)
+        if [[ -z "$EXISTING_NAME" ]]; then
+            echo ""
+            read -rp "  Git name  (e.g. 'Oz'): " GIT_NAME
+            read -rp "  Git email (e.g. 'oz@example.com'): " GIT_EMAIL
+            su - "$REAL_USER" -s /bin/bash -c "git config --global user.name '${GIT_NAME}'"
+            su - "$REAL_USER" -s /bin/bash -c "git config --global user.email '${GIT_EMAIL}'"
+        fi
+
+        GH_CONFIGURED=true
+        info "GitHub authenticated. 'git clone' works with private repos."
+    else
+        warn "Empty token — skipped GitHub auth."
+    fi
+else
+    info "Skipped GitHub token (you can run 'gh auth login' later)."
+fi
+
+# ============================================================
+# 7. Claude Code (native installer)
 # ============================================================
 header "Claude Code"
 su - "$REAL_USER" -s /bin/bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
@@ -276,7 +333,7 @@ chown -R "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/.config"
 info "Claude Code installed."
 
 # ============================================================
-# 7. Extras (curl, git, htop, ufw)
+# 8. Extras (curl, git, htop, ufw)
 # ============================================================
 header "Extras"
 apt-get install -y -qq curl git htop ufw
@@ -288,7 +345,7 @@ fi
 info "UFW firewall enabled (SSH allowed)."
 
 # ============================================================
-# 8. Cleanup
+# 9. Cleanup
 # ============================================================
 header "Cleanup"
 apt-get autoremove -y -qq
@@ -296,7 +353,7 @@ apt-get clean -qq
 info "Package cache cleaned."
 
 # ============================================================
-# 9. HEALTH CHECK
+# 10. HEALTH CHECK
 # ============================================================
 echo ""
 echo "========================================"
@@ -349,6 +406,13 @@ check "Docker Compose available"               "docker compose version"
 check "User in docker group" \
     "groups '${REAL_USER}' | grep -q docker"
 
+# --- GitHub ---
+check "GitHub CLI installed"                   "which gh"
+if [[ "$GH_CONFIGURED" == true ]]; then
+    check "GitHub auth active" \
+        "su - '${REAL_USER}' -s /bin/bash -c 'gh auth status' 2>&1 | grep -q 'Logged in'"
+fi
+
 # --- Claude Code ---
 check "Claude Code binary exists" \
     "test -f '${REAL_HOME}/.local/bin/claude'"
@@ -390,6 +454,7 @@ get_ver "OpenSSH"         "ssh -V 2>&1 | awk '{print \$1}'"
 get_ver "Docker"          "docker --version | grep -oP 'Docker version \K[^,]+'"
 get_ver "Docker Compose"  "docker compose version --short"
 get_ver "Docker Buildx"   "docker buildx version | awk '{print \$2}'"
+get_ver "GitHub CLI"      "gh --version | head -1 | awk '{print \$3}'"
 get_ver "Claude Code"     "su - '${REAL_USER}' -s /bin/bash -c '~/.local/bin/claude --version' 2>/dev/null || echo 'installed'"
 get_ver "UFW"             "ufw version | awk '{print \$NF}'"
 get_ver "Git"             "git --version | awk '{print \$NF}'"
@@ -400,6 +465,7 @@ echo "    1. Open a NEW terminal:  ssh ${REAL_USER}@<this-server>"
 echo "    2. Verify you get a fish prompt"
 echo "    3. Run 'claude' to authenticate Claude Code"
 echo "    4. Test docker:  docker run --rm hello-world"
+echo "    5. Test GitHub:  gh repo list --limit 3"
 echo ""
 warn "DO NOT close this session until you confirm SSH access in another terminal!"
 
