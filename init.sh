@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # ============================================================
 #  Fresh Ubuntu Server Setup
-#  Installs: fish shell, fail2ban, Claude Code
-#  Configures: SSH key-only auth (disables root password login)
+#  Installs: fish, fail2ban, docker, docker compose, claude code
+#  Configures: SSH key-only auth, UFW firewall, new sudo user
 #
-#  Usage (one-liner from GitHub):
-#    sudo bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/setup-server.sh)
+#  Usage:
+#    bash <(curl -fsSL https://raw.githubusercontent.com/0OZ/init-server/main/init.sh)
 # ============================================================
 
 set -euo pipefail
@@ -24,21 +24,64 @@ header(){ echo -e "\n${BOLD}── $* ──${NC}"; }
 
 # --- Must run as root ---
 if [[ $EUID -ne 0 ]]; then
-    error "Please run as root:  sudo bash <(curl -fsSL https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/setup-server.sh)"
+    error "Please run as root:"
+    echo "  bash <(curl -fsSL https://raw.githubusercontent.com/0OZ/init-server/main/init.sh)"
     exit 1
 fi
 
-# --- Resolve the real (non-root) user ---
+# ============================================================
+# 0. Resolve / create the non-root user
+# ============================================================
+header "User Setup"
+
 REAL_USER="${SUDO_USER:-}"
 if [[ -z "$REAL_USER" || "$REAL_USER" == "root" ]]; then
-    # When piped via curl, SUDO_USER may be empty — prompt for it
     read -rp "Enter the non-root username to configure: " REAL_USER
-    if ! id "$REAL_USER" &>/dev/null; then
-        error "User '${REAL_USER}' does not exist."
+fi
+
+if ! id "$REAL_USER" &>/dev/null; then
+    warn "User '${REAL_USER}' does not exist."
+    read -rp "Create user '${REAL_USER}' with sudo access? [y/N] " CREATE_CONFIRM
+    if [[ "${CREATE_CONFIRM,,}" != "y" ]]; then
+        error "Aborted. Create the user manually first, then re-run."
         exit 1
     fi
+
+    adduser --disabled-password --gecos "" "$REAL_USER"
+    usermod -aG sudo "$REAL_USER"
+
+    # Passwordless sudo (password login is disabled entirely)
+    echo "${REAL_USER} ALL=(ALL) NOPASSWD:ALL" > "/etc/sudoers.d/${REAL_USER}"
+    chmod 440 "/etc/sudoers.d/${REAL_USER}"
+    info "User '${REAL_USER}' created with sudo access."
+
+    # --- Copy SSH keys from root → new user ---
+    REAL_HOME=$(eval echo "~${REAL_USER}")
+    mkdir -p "${REAL_HOME}/.ssh"
+
+    if [[ -s /root/.ssh/authorized_keys ]]; then
+        cp /root/.ssh/authorized_keys "${REAL_HOME}/.ssh/authorized_keys"
+        info "Copied root's SSH keys → ${REAL_USER}"
+    else
+        warn "No SSH keys found on root either."
+        echo ""
+        echo "  Paste your public SSH key (one line), then press Enter:"
+        read -r SSH_KEY
+        if [[ -z "$SSH_KEY" ]]; then
+            error "No key provided. Cannot continue without SSH access."
+            exit 1
+        fi
+        echo "$SSH_KEY" > "${REAL_HOME}/.ssh/authorized_keys"
+        info "SSH key added for '${REAL_USER}'."
+    fi
+
+    chmod 700 "${REAL_HOME}/.ssh"
+    chmod 600 "${REAL_HOME}/.ssh/authorized_keys"
+    chown -R "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/.ssh"
+else
+    info "User '${REAL_USER}' already exists."
+    REAL_HOME=$(eval echo "~${REAL_USER}")
 fi
-REAL_HOME=$(eval echo "~${REAL_USER}")
 
 # --- Pre-flight: SSH key check ---
 AUTH_KEYS="${REAL_HOME}/.ssh/authorized_keys"
@@ -53,7 +96,6 @@ echo ""
 echo "========================================"
 echo "  Starting Ubuntu Server Setup"
 echo "========================================"
-echo ""
 
 # ============================================================
 # 1. System update
@@ -64,7 +106,7 @@ apt-get upgrade -y -qq
 info "System packages updated."
 
 # ============================================================
-# 2. Install Fish shell
+# 2. Fish shell
 # ============================================================
 header "Fish Shell"
 apt-get install -y -qq fish
@@ -77,7 +119,7 @@ chsh -s "$FISH_PATH" "$REAL_USER"
 info "Fish installed and set as default shell for '${REAL_USER}'."
 
 # ============================================================
-# 3. Install & configure fail2ban
+# 3. fail2ban
 # ============================================================
 header "fail2ban"
 apt-get install -y -qq fail2ban
@@ -103,7 +145,7 @@ systemctl restart fail2ban
 info "fail2ban enabled with SSH jail (3 attempts → 3h ban)."
 
 # ============================================================
-# 4. Harden SSH
+# 4. SSH hardening
 # ============================================================
 header "SSH Hardening"
 
@@ -132,7 +174,39 @@ else
 fi
 
 # ============================================================
-# 5. Install Claude Code (native installer)
+# 5. Docker + Docker Compose (official repo)
+# ============================================================
+header "Docker"
+
+# Install prerequisites
+apt-get install -y -qq ca-certificates curl gnupg
+
+# Add Docker's official GPG key
+install -m 0755 -d /etc/apt/keyrings
+if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
+        | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    chmod a+r /etc/apt/keyrings/docker.gpg
+fi
+
+# Add the Docker repo
+UBUNTU_CODENAME=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+cat > /etc/apt/sources.list.d/docker.list <<EOF
+deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${UBUNTU_CODENAME} stable
+EOF
+
+apt-get update -qq
+apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# Let the user run docker without sudo
+usermod -aG docker "$REAL_USER"
+
+systemctl enable docker
+systemctl start docker
+info "Docker + Docker Compose installed. '${REAL_USER}' added to docker group."
+
+# ============================================================
+# 6. Claude Code (native installer)
 # ============================================================
 header "Claude Code"
 su - "$REAL_USER" -s /bin/bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
@@ -141,12 +215,12 @@ FISH_CONFIG="${REAL_HOME}/.config/fish/config.fish"
 mkdir -p "$(dirname "$FISH_CONFIG")"
 if [[ ! -f "$FISH_CONFIG" ]] || ! grep -q '.local/bin' "$FISH_CONFIG"; then
     echo 'fish_add_path -g $HOME/.local/bin' >> "$FISH_CONFIG"
-    chown "$REAL_USER":"$REAL_USER" "$FISH_CONFIG"
 fi
+chown -R "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/.config"
 info "Claude Code installed."
 
 # ============================================================
-# 6. Extras (curl, git, htop, ufw)
+# 7. Extras (curl, git, htop, ufw)
 # ============================================================
 header "Extras"
 apt-get install -y -qq curl git htop ufw
@@ -158,7 +232,7 @@ fi
 info "UFW firewall enabled (SSH allowed)."
 
 # ============================================================
-# 7. Cleanup
+# 8. Cleanup
 # ============================================================
 header "Cleanup"
 apt-get autoremove -y -qq
@@ -166,7 +240,7 @@ apt-get clean -qq
 info "Package cache cleaned."
 
 # ============================================================
-# 8. HEALTH CHECK
+# 9. HEALTH CHECK
 # ============================================================
 echo ""
 echo "========================================"
@@ -189,13 +263,17 @@ check() {
     fi
 }
 
+# --- User ---
+check "User '${REAL_USER}' exists"            "id '${REAL_USER}'"
+check "User has sudo access"                   "groups '${REAL_USER}' | grep -q sudo"
+
 # --- Fish ---
-check "Fish installed"                      "which fish"
+check "Fish installed"                         "which fish"
 check "Fish is default shell for ${REAL_USER}" \
     "getent passwd '${REAL_USER}' | grep -q fish"
 
 # --- fail2ban ---
-check "fail2ban service running"            "systemctl is-active --quiet fail2ban"
+check "fail2ban service running"               "systemctl is-active --quiet fail2ban"
 check "fail2ban SSH jail active" \
     "fail2ban-client status sshd 2>/dev/null | grep -q 'Status for the jail: sshd'"
 
@@ -204,34 +282,53 @@ check "PasswordAuthentication disabled" \
     "sshd -T 2>/dev/null | grep -qi 'passwordauthentication no'"
 check "PermitRootLogin disabled" \
     "sshd -T 2>/dev/null | grep -qi 'permitrootlogin no'"
+check "SSH key exists for ${REAL_USER}" \
+    "test -s '${REAL_HOME}/.ssh/authorized_keys'"
+
+# --- Docker ---
+check "Docker daemon running"                  "systemctl is-active --quiet docker"
+check "Docker CLI works"                       "docker --version"
+check "Docker Compose available"               "docker compose version"
+check "User in docker group" \
+    "groups '${REAL_USER}' | grep -q docker"
 
 # --- Claude Code ---
 check "Claude Code binary exists" \
     "test -f '${REAL_HOME}/.local/bin/claude'"
 
 # --- UFW ---
-check "UFW active"                          "ufw status | grep -q 'Status: active'"
-check "UFW allows SSH"                      "ufw status | grep -q 'OpenSSH'"
+check "UFW active"                             "ufw status | grep -q 'Status: active'"
+check "UFW allows SSH"                         "ufw status | grep -q 'OpenSSH'"
 
 # --- Clean system ---
 check "No pending security updates" \
     "! apt list --upgradable 2>/dev/null | grep -qi 'security'"
 
 # --- Summary ---
+TOTAL=$((CHECKS_PASSED + CHECKS_FAILED))
 echo ""
 echo "========================================"
 if [[ $CHECKS_FAILED -eq 0 ]]; then
-    echo -e "  ${GREEN}${BOLD}All ${CHECKS_PASSED}/${CHECKS_PASSED} checks passed ✓${NC}"
+    echo -e "  ${GREEN}${BOLD}All ${TOTAL}/${TOTAL} checks passed ✓${NC}"
 else
-    echo -e "  ${GREEN}${CHECKS_PASSED} passed${NC} / ${RED}${CHECKS_FAILED} failed${NC}"
+    echo -e "  ${GREEN}${CHECKS_PASSED} passed${NC} / ${RED}${CHECKS_FAILED} failed${NC}  (${TOTAL} total)"
 fi
 echo "========================================"
 
 echo ""
+echo "  Installed:"
+echo "    • Fish shell (default for ${REAL_USER})"
+echo "    • fail2ban (SSH jail active)"
+echo "    • Docker $(docker --version 2>/dev/null | grep -oP 'Docker version \K[^,]+')"
+echo "    • Docker Compose $(docker compose version 2>/dev/null | grep -oP 'v[\d.]+')"
+echo "    • Claude Code"
+echo "    • UFW firewall"
+echo ""
 echo "  Next steps:"
-echo "    1. Open a NEW terminal and verify SSH key login"
-echo "    2. Run 'claude' to authenticate Claude Code"
-echo "    3. Optionally reboot:  sudo reboot"
+echo "    1. Open a NEW terminal:  ssh ${REAL_USER}@<this-server>"
+echo "    2. Verify you get a fish prompt"
+echo "    3. Run 'claude' to authenticate Claude Code"
+echo "    4. Test docker:  docker run --rm hello-world"
 echo ""
 warn "DO NOT close this session until you confirm SSH access in another terminal!"
 
