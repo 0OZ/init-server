@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # --- Script version ---
-SCRIPT_VERSION="1.0.0"
+SCRIPT_VERSION="1.1.0"
 SCRIPT_REPO="0OZ/init-server"
 SCRIPT_RAW="https://raw.githubusercontent.com/${SCRIPT_REPO}/main/init.sh"
 
@@ -182,9 +182,19 @@ PYTHONWARNINGS=ignore apt-get install -y -qq fail2ban
 
 cat > /etc/fail2ban/jail.local <<'EOF'
 [DEFAULT]
-bantime  = 1h
+bantime  = 15m
 findtime = 10m
 maxretry = 5
+
+# Repeat offenders get progressively longer bans automatically.
+# First ban = 15m, then doubles each time the same IP re-offends,
+# capped at 24h. Honest mistakes stay cheap; brute-forcers get hammered.
+bantime.increment = true
+bantime.factor    = 2
+bantime.maxtime   = 24h
+
+# Never ban localhost
+ignoreip = 127.0.0.1/8 ::1
 
 [sshd]
 enabled  = true
@@ -192,13 +202,13 @@ port     = ssh
 filter   = sshd
 logpath  = %(sshd_log)s
 backend  = %(sshd_backend)s
-maxretry = 3
-bantime  = 3h
+maxretry = 5
+bantime  = 15m
 EOF
 
 systemctl enable fail2ban
 systemctl restart fail2ban
-info "fail2ban enabled with SSH jail (3 attempts → 3h ban)."
+info "fail2ban enabled with SSH jail (5 attempts → 15m ban, escalating)."
 
 # ============================================================
 # 4. SSH hardening
