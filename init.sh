@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # --- Script version ---
-SCRIPT_VERSION="1.1.0"
+SCRIPT_VERSION="1.1.1"
 SCRIPT_REPO="0OZ/init-server"
 SCRIPT_RAW="https://raw.githubusercontent.com/${SCRIPT_REPO}/main/init.sh"
 
@@ -278,13 +278,18 @@ header "GitHub"
 
 # Install gh CLI from official repo
 if ! command -v gh &>/dev/null; then
-    (type -p wget >/dev/null || apt-get install -y -qq wget)
     mkdir -p -m 755 /etc/apt/keyrings
-    out=$(wget -qO- https://cli.github.com/packages/githubcli-archive-keyring.gpg) \
-        && echo "$out" | tee /etc/apt/keyrings/githubcli-archive-keyring.gpg >/dev/null
+
+    # Download the keyring DIRECTLY to disk. Never round-trip binary data
+    # through a shell variable — bash strips null bytes from variable
+    # contents, which silently corrupts the keyring and breaks apt signing.
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
     chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-        | tee /etc/apt/sources.list.d/github-cli-stable.list >/dev/null
+        > /etc/apt/sources.list.d/github-cli-stable.list
+
     apt-get update -qq
     apt-get install -y -qq gh
 fi
