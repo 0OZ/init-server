@@ -230,6 +230,10 @@ if ! grep -q "^Include /etc/ssh/sshd_config.d/" "$SSHD_CONFIG"; then
     sed -i '1i Include /etc/ssh/sshd_config.d/*.conf' "$SSHD_CONFIG"
 fi
 
+# sshd -t needs privsep dir; missing on minimal/container images
+mkdir -p /run/sshd
+chmod 0755 /run/sshd
+
 if sshd -t; then
     systemctl restart "$SSH_SERVICE"
     info "SSH hardened — root login & password auth disabled."
