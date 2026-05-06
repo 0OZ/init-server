@@ -15,7 +15,7 @@
 set -euo pipefail
 
 # --- Script version ---
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.2.0"
 SCRIPT_REPO="0OZ/init-server"
 SCRIPT_RAW="https://raw.githubusercontent.com/${SCRIPT_REPO}/main/init.sh"
 
@@ -154,18 +154,56 @@ else
 fi
 
 # ============================================================
-# 1. System update
+# 1. System update + prefetch + batch install
 # ============================================================
-header "System Update"
+header "System Update + Prefetch"
+
+# Background: fetch GPG keys + Claude installer while apt runs.
+# Bash strips NULs from variables — always write keyrings to disk.
+install -m 0755 -d /etc/apt/keyrings
+
+(curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /tmp/docker.gpg.raw) &
+DOCKER_GPG_PID=$!
+
+(curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    -o /etc/apt/keyrings/githubcli-archive-keyring.gpg) &
+GH_GPG_PID=$!
+
+(curl -fsSL https://claude.ai/install.sh -o /tmp/claude-install.sh) &
+CLAUDE_DL_PID=$!
+
 apt-get update -qq
 apt-get upgrade -y -qq
-info "System packages updated."
+apt-get install -y -qq ca-certificates curl gnupg
+
+# Wait for keys before adding repos
+wait $DOCKER_GPG_PID $GH_GPG_PID || true
+
+gpg --dearmor < /tmp/docker.gpg.raw > /etc/apt/keyrings/docker.gpg
+chmod a+r /etc/apt/keyrings/docker.gpg
+chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
+rm -f /tmp/docker.gpg.raw
+
+UBUNTU_CODENAME=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
+cat > /etc/apt/sources.list.d/docker.list <<EOF
+deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${UBUNTU_CODENAME} stable
+EOF
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    > /etc/apt/sources.list.d/github-cli-stable.list
+
+apt-get update -qq
+
+# One big install — saves repeated dep resolution
+PYTHONWARNINGS=ignore apt-get install -y -qq \
+    fish fail2ban git htop ufw \
+    docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin \
+    gh
+info "All packages installed."
 
 # ============================================================
 # 2. Fish shell
 # ============================================================
 header "Fish Shell"
-apt-get install -y -qq fish
 
 FISH_PATH=$(which fish)
 if ! grep -q "$FISH_PATH" /etc/shells; then
@@ -178,7 +216,6 @@ info "Fish installed and set as default shell for '${REAL_USER}'."
 # 3. fail2ban
 # ============================================================
 header "fail2ban"
-PYTHONWARNINGS=ignore apt-get install -y -qq fail2ban
 
 cat > /etc/fail2ban/jail.local <<'EOF'
 [DEFAULT]
@@ -244,59 +281,19 @@ else
 fi
 
 # ============================================================
-# 5. Docker + Docker Compose (official repo)
+# 5. Docker post-install
 # ============================================================
 header "Docker"
 
-# Install prerequisites
-apt-get install -y -qq ca-certificates curl gnupg
-
-# Add Docker's official GPG key
-install -m 0755 -d /etc/apt/keyrings
-if [[ ! -f /etc/apt/keyrings/docker.gpg ]]; then
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg \
-        | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    chmod a+r /etc/apt/keyrings/docker.gpg
-fi
-
-# Add the Docker repo
-UBUNTU_CODENAME=$(. /etc/os-release && echo "${UBUNTU_CODENAME:-$VERSION_CODENAME}")
-cat > /etc/apt/sources.list.d/docker.list <<EOF
-deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${UBUNTU_CODENAME} stable
-EOF
-
-apt-get update -qq
-apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-# Let the user run docker without sudo
 usermod -aG docker "$REAL_USER"
-
 systemctl enable docker
 systemctl start docker
-info "Docker + Docker Compose installed. '${REAL_USER}' added to docker group."
+info "Docker enabled. '${REAL_USER}' added to docker group."
 
 # ============================================================
-# 6. GitHub CLI + private repo access
+# 6. GitHub CLI auth
 # ============================================================
 header "GitHub"
-
-# Install gh CLI from official repo
-if ! command -v gh &>/dev/null; then
-    mkdir -p -m 755 /etc/apt/keyrings
-
-    # Download the keyring DIRECTLY to disk. Never round-trip binary data
-    # through a shell variable — bash strips null bytes from variable
-    # contents, which silently corrupts the keyring and breaks apt signing.
-    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg
-    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg
-
-    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-        > /etc/apt/sources.list.d/github-cli-stable.list
-
-    apt-get update -qq
-    apt-get install -y -qq gh
-fi
 info "GitHub CLI (gh) installed."
 
 # Optional: configure token for private repos
@@ -338,10 +335,18 @@ else
 fi
 
 # ============================================================
-# 7. Claude Code (native installer)
+# 7. Claude Code (native installer — prefetched)
 # ============================================================
 header "Claude Code"
-su - "$REAL_USER" -s /bin/bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
+wait $CLAUDE_DL_PID 2>/dev/null || true
+if [[ -s /tmp/claude-install.sh ]]; then
+    cp /tmp/claude-install.sh "${REAL_HOME}/claude-install.sh"
+    chown "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/claude-install.sh"
+    su - "$REAL_USER" -s /bin/bash -c "bash ~/claude-install.sh"
+    rm -f "${REAL_HOME}/claude-install.sh" /tmp/claude-install.sh
+else
+    su - "$REAL_USER" -s /bin/bash -c 'curl -fsSL https://claude.ai/install.sh | bash'
+fi
 
 FISH_CONFIG="${REAL_HOME}/.config/fish/config.fish"
 mkdir -p "$(dirname "$FISH_CONFIG")"
@@ -352,11 +357,9 @@ chown -R "${REAL_USER}:${REAL_USER}" "${REAL_HOME}/.config"
 info "Claude Code installed."
 
 # ============================================================
-# 8. Extras (curl, git, htop, ufw)
+# 8. UFW firewall
 # ============================================================
-header "Extras"
-apt-get install -y -qq curl git htop ufw
-
+header "UFW"
 if ! ufw status | grep -q "active"; then
     ufw allow OpenSSH
     ufw --force enable
@@ -383,16 +386,25 @@ echo ""
 CHECKS_PASSED=0
 CHECKS_FAILED=0
 
+CHECK_TMP=$(mktemp -d)
+trap 'rm -rf "$CHECK_TMP"' EXIT
+CHECK_IDX=0
+
+# Run check in background; record result for ordered replay later.
+# Subshell ((var++)) wouldn't propagate, so we tally after wait.
 check() {
-    local label="$1"
-    shift
-    if eval "$@" &>/dev/null; then
-        info "$label"
-        ((CHECKS_PASSED++))
-    else
-        error "$label"
-        ((CHECKS_FAILED++))
-    fi
+    local label="$1"; shift
+    CHECK_IDX=$((CHECK_IDX+1))
+    local id
+    id=$(printf "%04d" $CHECK_IDX)
+    local cmd="$*"
+    (
+        if eval "$cmd" &>/dev/null; then
+            printf 'PASS|%s\n' "$label" > "$CHECK_TMP/$id"
+        else
+            printf 'FAIL|%s\n' "$label" > "$CHECK_TMP/$id"
+        fi
+    ) &
 }
 
 # --- User ---
@@ -444,6 +456,22 @@ check "UFW allows SSH"                         "ufw status | grep -q 'OpenSSH'"
 check "No pending security updates" \
     "! apt list --upgradable 2>/dev/null | grep -qi 'security'"
 
+# Wait for all parallel checks, then replay in order
+wait
+for f in "$CHECK_TMP"/*; do
+    [[ -e "$f" ]] || continue
+    line=$(< "$f")
+    status="${line%%|*}"
+    label="${line#*|}"
+    if [[ "$status" == "PASS" ]]; then
+        info "$label"
+        CHECKS_PASSED=$((CHECKS_PASSED+1))
+    else
+        error "$label"
+        CHECKS_FAILED=$((CHECKS_FAILED+1))
+    fi
+done
+
 # --- Summary ---
 TOTAL=$((CHECKS_PASSED + CHECKS_FAILED))
 echo ""
@@ -459,10 +487,21 @@ echo "========================================"
 echo ""
 echo -e "  ${BOLD}Versions:${NC}"
 
+VER_TMP=$(mktemp -d)
+VER_IDX=0
+
 get_ver() {
-    local val
-    val=$( eval "$2" 2>/dev/null ) || val="not found"
-    printf "    %-20s %s\n" "$1" "$val"
+    VER_IDX=$((VER_IDX+1))
+    local id
+    id=$(printf "%04d" $VER_IDX)
+    local label="$1"
+    local cmd="$2"
+    (
+        local val
+        val=$( eval "$cmd" 2>/dev/null ) || val="not found"
+        [[ -z "$val" ]] && val="not found"
+        printf "    %-20s %s\n" "$label" "$val" > "$VER_TMP/$id"
+    ) &
 }
 
 get_ver "Ubuntu"          "lsb_release -ds"
@@ -478,6 +517,12 @@ get_ver "Claude Code"     "su - '${REAL_USER}' -s /bin/bash -c '~/.local/bin/cla
 get_ver "UFW"             "ufw version | awk '{print \$NF}'"
 get_ver "Git"             "git --version | awk '{print \$NF}'"
 get_ver "init-server"     "echo v${SCRIPT_VERSION}"
+
+wait
+for f in "$VER_TMP"/*; do
+    [[ -e "$f" ]] && cat "$f"
+done
+rm -rf "$VER_TMP"
 echo ""
 echo "  Next steps:"
 echo "    1. Open a NEW terminal:  ssh ${REAL_USER}@<this-server>"
