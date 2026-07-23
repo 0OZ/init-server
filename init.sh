@@ -10,12 +10,25 @@
 #  Flags:
 #    --version, -v   Print script version
 #    --check         Compare local vs remote version
+#
+#  Env vars (all optional — unset falls back to an interactive prompt;
+#  required when piped/non-interactive, e.g. run over `ssh host "…"`):
+#    INIT_USER        Non-root user to configure/create
+#    INIT_YES=1       Auto-confirm prompts (create user, version-continue)
+#    INIT_SSH_PUBKEY  Public key to add (only if root has none)
+#    INIT_GH_TOKEN    GitHub token for private repos (unset → skip gh auth)
+#    INIT_GIT_NAME    git user.name
+#    INIT_GIT_EMAIL   git user.email
+#
+#  Non-interactive example (one server, hands-off):
+#    ssh root@HOST "INIT_USER=oz INIT_YES=1 \
+#      bash <(curl -fsSL https://raw.githubusercontent.com/0OZ/init-server/main/init.sh)"
 # ============================================================
 
 set -euo pipefail
 
 # --- Script version ---
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.3.0"
 SCRIPT_REPO="0OZ/init-server"
 SCRIPT_RAW="https://raw.githubusercontent.com/${SCRIPT_REPO}/main/init.sh"
 
@@ -32,6 +45,41 @@ warn()  { echo -e "${YELLOW}[!]${NC} $*"; }
 error() { echo -e "${RED}[✗]${NC} $*"; }
 header(){ echo -e "\n${BOLD}── $* ──${NC}"; }
 ver()   { echo -e "  ${DIM}$1${NC} $2"; }
+
+# --- Input resolution: env var → prompt → error ---------------------
+# Interactive when stdin is a TTY. Piped runs (e.g. `ssh host "…"`) are not,
+# so every value must arrive via an INIT_* env var or the run aborts instead
+# of blocking on a read that can never be answered.
+if [[ -t 0 ]]; then INTERACTIVE=1; else INTERACTIVE=0; fi
+
+# ask <outvar> <env_value> <prompt> [--secret]
+#   env_value non-empty → assign it to outvar, return 0
+#   else interactive    → prompt, read into outvar, return 0
+#   else                → return 1, leave outvar untouched (caller decides)
+ask() {
+    local __out="$1" __env="$2" __prompt="$3" __secret="${4:-}"
+    if [[ -n "$__env" ]]; then
+        printf -v "$__out" '%s' "$__env"
+        return 0
+    fi
+    if [[ "$INTERACTIVE" -eq 1 ]]; then
+        local __val
+        if [[ "$__secret" == "--secret" ]]; then
+            read -rsp "$__prompt" __val || return 1
+            echo ""
+        else
+            read -rp "$__prompt" __val || return 1
+        fi
+        printf -v "$__out" '%s' "$__val"
+        return 0
+    fi
+    return 1
+}
+
+# Sourced by tests to exercise ask() without running provisioning.
+if [[ -n "${INIT_SELFTEST:-}" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
 
 # --- --version / --check flags ---
 if [[ "${1:-}" == "--version" || "${1:-}" == "-v" ]]; then
@@ -75,16 +123,21 @@ fi
 # ============================================================
 header "User Setup"
 
-REAL_USER="${SUDO_USER:-}"
+REAL_USER="${INIT_USER:-${SUDO_USER:-}}"
 if [[ -z "$REAL_USER" || "$REAL_USER" == "root" ]]; then
-    read -rp "Enter the non-root username to configure: " REAL_USER
+    ask REAL_USER "${INIT_USER:-}" "Enter the non-root username to configure: " \
+        || { error "No username. Set INIT_USER or run interactively."; exit 1; }
 fi
 
 if ! id "$REAL_USER" &>/dev/null; then
     warn "User '${REAL_USER}' does not exist."
-    read -rp "Create user '${REAL_USER}' with sudo access? [y/N] " CREATE_CONFIRM
+    if [[ "${INIT_YES:-}" == "1" ]]; then
+        CREATE_CONFIRM=y
+    else
+        ask CREATE_CONFIRM "" "Create user '${REAL_USER}' with sudo access? [y/N] " || CREATE_CONFIRM=n
+    fi
     if [[ "${CREATE_CONFIRM,,}" != "y" ]]; then
-        error "Aborted. Create the user manually first, then re-run."
+        error "Aborted. Create the user manually first, or set INIT_YES=1, then re-run."
         exit 1
     fi
 
@@ -106,8 +159,10 @@ if ! id "$REAL_USER" &>/dev/null; then
     else
         warn "No SSH keys found on root either."
         echo ""
-        echo "  Paste your public SSH key (one line), then press Enter:"
-        read -r SSH_KEY
+        if ! ask SSH_KEY "${INIT_SSH_PUBKEY:-}" "  Paste your public SSH key (one line), then press Enter: "; then
+            error "No SSH key. Set INIT_SSH_PUBKEY or run interactively — cannot continue without SSH access."
+            exit 1
+        fi
         if [[ -z "$SSH_KEY" ]]; then
             error "No key provided. Cannot continue without SSH access."
             exit 1
@@ -145,9 +200,11 @@ REMOTE_VER=$(curl -fsSL --connect-timeout 3 "$SCRIPT_RAW" 2>/dev/null \
 if [[ -n "$REMOTE_VER" && "$REMOTE_VER" != "$SCRIPT_VERSION" ]]; then
     warn "Script update available: v${SCRIPT_VERSION} → v${REMOTE_VER}"
     warn "Re-run with: bash <(curl -fsSL ${SCRIPT_RAW})"
-    read -rp "Continue with current version anyway? [Y/n] " UPDATE_CONFIRM
-    if [[ "${UPDATE_CONFIRM,,}" == "n" ]]; then
-        exit 0
+    if [[ "${INIT_YES:-}" != "1" ]]; then
+        ask UPDATE_CONFIRM "" "Continue with current version anyway? [Y/n] " || UPDATE_CONFIRM=y
+        if [[ "${UPDATE_CONFIRM,,}" == "n" ]]; then
+            exit 0
+        fi
     fi
 else
     info "Script is up to date (v${SCRIPT_VERSION})."
@@ -299,14 +356,19 @@ info "GitHub CLI (gh) installed."
 # Optional: configure token for private repos
 GH_CONFIGURED=false
 echo ""
-read -rp "Configure a GitHub token for private repos? [y/N] " GH_CONFIRM
+if [[ -n "${INIT_GH_TOKEN:-}" ]]; then
+    GH_CONFIRM=y
+elif [[ "$INTERACTIVE" -eq 1 ]]; then
+    ask GH_CONFIRM "" "Configure a GitHub token for private repos? [y/N] " || GH_CONFIRM=n
+else
+    GH_CONFIRM=n
+fi
 if [[ "${GH_CONFIRM,,}" == "y" ]]; then
     echo ""
     echo "  Create a token at: https://github.com/settings/tokens"
     echo "  Scopes needed: repo, read:org (Fine-grained: Contents read)"
     echo ""
-    read -rsp "  Paste your GitHub token (hidden): " GH_TOKEN
-    echo ""
+    ask GH_TOKEN "${INIT_GH_TOKEN:-}" "  Paste your GitHub token (hidden): " --secret || GH_TOKEN=""
 
     if [[ -n "$GH_TOKEN" ]]; then
         # Auth gh CLI (configures git credential helper automatically)
@@ -319,10 +381,14 @@ if [[ "${GH_CONFIRM,,}" == "y" ]]; then
         EXISTING_NAME=$(su - "$REAL_USER" -s /bin/bash -c "git config --global user.name" 2>/dev/null || true)
         if [[ -z "$EXISTING_NAME" ]]; then
             echo ""
-            read -rp "  Git name  (e.g. 'Oz'): " GIT_NAME
-            read -rp "  Git email (e.g. 'oz@example.com'): " GIT_EMAIL
-            su - "$REAL_USER" -s /bin/bash -c "git config --global user.name '${GIT_NAME}'"
-            su - "$REAL_USER" -s /bin/bash -c "git config --global user.email '${GIT_EMAIL}'"
+            ask GIT_NAME "${INIT_GIT_NAME:-}" "  Git name  (e.g. 'Oz'): " || GIT_NAME=""
+            ask GIT_EMAIL "${INIT_GIT_EMAIL:-}" "  Git email (e.g. 'oz@example.com'): " || GIT_EMAIL=""
+            if [[ -n "$GIT_NAME" ]]; then
+                su - "$REAL_USER" -s /bin/bash -c "git config --global user.name '${GIT_NAME}'"
+            fi
+            if [[ -n "$GIT_EMAIL" ]]; then
+                su - "$REAL_USER" -s /bin/bash -c "git config --global user.email '${GIT_EMAIL}'"
+            fi
         fi
 
         GH_CONFIGURED=true
